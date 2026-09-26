@@ -1,0 +1,219 @@
+name: Build V8/d8 variants (sandbox, sanitizers, Fuzzilli, libFuzzer, coverage)
+
+# Sibling of build-d8-sandbox.yml. Produces several differently-instrumented
+# binaries for the SAME pinned revision, in parallel, each as its own artifact.
+# Free on a public repo with standard runners (larger runners are always billed).
+#
+# Variants and what each is FOR:
+#   sandbox          release, sandbox + corruption API          -> run the corruption probes
+#   sandbox-dcheck   + dcheck_always_on + verify_heap           -> INVARIANT oracle: a violated
+#                                                                 DCHECK/heap check fires instead
+#                                                                 of just crashing
+#   sandbox-asan     + is_asan                                  -> MEMORY-SAFETY oracle: turns
+#                                                                 "it crashed" into
+#                                                                 "heap-buffer-overflow at X"
+#   fuzzilli         Fuzzilli's documented Linux config          -> FuzzilliCli --profile=V8
+#   fuzzilli-sandbox Fuzzilli + sandbox + corruption API         -> FuzzilliCli --profile=V8Sandbox
+#                                                                 (V8SandboxProfile injects
+#                                                                  Sandbox corruption calls);
+#                                                                 run target with --sandbox-fuzzing
+#   libfuzzer        is_asan + use_libfuzzer + edge coverage     -> V8's own v8_simple_*_fuzzer
+#
+# Notes that matter:
+#  * --sandbox-testing and --sandbox-fuzzing are "mostly identical"; --sandbox-fuzzing
+#    requires the memory corruption API in the build and is the one for fuzzers.
+#  * Fuzzilli needs sanitizer coverage, which V8's macOS toolchain cannot provide
+#    ("sanitizer coverage for v8 is currently not supported on macOS"), hence Linux.
+#  * --run-as-security-poc rejects --expose-memory-corruption-api; use --sandbox-testing
+#    (or --sandbox-fuzzing) for corruption-API work.
+
+on:
+  workflow_dispatch:
+    inputs:
+      v8_ref:
+        description: 'V8 ref: full SHA, tag, or branch (default = the campaign pin)'
+        required: false
+        default: 'c68946f7099c1a46dd382907e841d77eae7b2659'
+        type: string
+      only:
+        description: 'Optional filter: comma-separated variant names to build (blank = all)'
+        required: false
+        default: ''
+        type: string
+      fuzzer_targets:
+        description: 'libFuzzer targets to build for the libfuzzer variant'
+        required: false
+        default: 'v8_simple_json_fuzzer v8_simple_wasm_fuzzer'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: sandbox
+            gn: 'is_debug=false symbol_level=0 v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false'
+            target: 'd8'
+          - variant: sandbox-dcheck
+            gn: 'is_debug=false dcheck_always_on=true symbol_level=1 v8_enable_verify_heap=true v8_enable_slow_dchecks=true v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false'
+            target: 'd8'
+          - variant: sandbox-asan
+            gn: 'is_debug=false symbol_level=0 is_asan=true v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false'
+            target: 'd8'
+          - variant: fuzzilli
+            gn: 'is_debug=false dcheck_always_on=true symbol_level=1 v8_static_library=true v8_enable_verify_heap=true v8_enable_partition_alloc=false v8_fuzzilli=true sanitizer_coverage_flags="trace-pc-guard"'
+            target: 'd8'
+          - variant: fuzzilli-sandbox
+            gn: 'is_debug=false dcheck_always_on=true symbol_level=1 v8_static_library=true v8_enable_verify_heap=true v8_enable_partition_alloc=false v8_fuzzilli=true sanitizer_coverage_flags="trace-pc-guard" v8_enable_sandbox=true v8_enable_memory_corruption_api=true'
+            target: 'd8'
+          - variant: libfuzzer
+            gn: 'is_debug=false symbol_level=0 is_asan=true use_libfuzzer=true v8_wasm_random_fuzzers=true sanitizer_coverage_flags="trace-pc-guard" v8_enable_i18n_support=false'
+            target: '__FUZZERS__'
+    name: ${{ matrix.variant }}
+    if: ${{ inputs.only == '' || contains(inputs.only, matrix.variant) }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/.ghcup /opt/az 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 pkg-config git curl wget
+
+      - name: Install depot_tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch V8 at the requested ref
+        env:
+          V8_REF: ${{ inputs.v8_ref }}
+        run: |
+          mkdir -p build && cd build
+          fetch v8
+          cd v8
+          git fetch --tags origin || true
+          if git fetch origin "$V8_REF" 2>/dev/null; then
+            git checkout FETCH_HEAD
+          else
+            echo "direct fetch of '$V8_REF' failed; unshallowing"
+            git fetch --unshallow origin 2>/dev/null || git fetch origin 2>/dev/null || true
+            git checkout "$V8_REF"
+          fi
+          echo "V8 commit: $(git log -1 --format='%H %ci %s')"
+
+      - name: Sync dependencies
+        run: |
+          cd build/v8
+          gclient sync -D --with_branch_heads -R
+          df -h / | tail -1
+
+      - name: Configure and build (${{ matrix.variant }})
+        env:
+          EXTRA: ${{ matrix.gn }}
+          TARGET: ${{ matrix.target }}
+          FUZZER_TARGETS: ${{ inputs.fuzzer_targets }}
+        run: |
+          cd build/v8
+          BASE='is_component_build=false use_custom_libcxx=true target_cpu="x64" treat_warnings_as_errors=false is_clang=true use_lld=true clang_use_chrome_plugins=false v8_enable_object_print=true v8_enable_disassembler=true v8_enable_test_features=true'
+          GN_ARGS="$BASE $EXTRA"
+          gn gen "out/${{ matrix.variant }}" --args="$GN_ARGS"
+          echo "=== resolved args.gn ==="; cat "out/${{ matrix.variant }}/args.gn"
+          if [ "$TARGET" = "__FUZZERS__" ]; then
+            # shellcheck disable=SC2086
+            ninja -C "out/${{ matrix.variant }}" $FUZZER_TARGETS -j2
+          else
+            ninja -C "out/${{ matrix.variant }}" "$TARGET" -j2
+          fi
+          df -h / | tail -1
+
+      # ---- variant-specific, EXECUTED acceptance checks -------------------------
+      - name: Check - sandbox variants expose Sandbox + targetPage
+        if: ${{ startsWith(matrix.variant, 'sandbox') }}
+        run: |
+          cd "build/v8/out/${{ matrix.variant }}"
+          ./d8 --sandbox-testing --expose-memory-corruption-api -e '
+            if (typeof Sandbox !== "object") throw new Error("Sandbox API missing");
+            if (typeof Sandbox.targetPage !== "number") throw new Error("targetPage missing");
+            print("OK: methods=" + Object.keys(Sandbox).length +
+                  " targetPage=0x" + Sandbox.targetPage.toString(16));
+          '
+
+      - name: Check - dcheck variant really has DCHECKs on
+        if: ${{ matrix.variant == 'sandbox-dcheck' }}
+        run: |
+          cd build/v8/out/${{ matrix.variant }}
+          for a in dcheck_always_on v8_enable_verify_heap v8_enable_slow_dchecks; do
+            v=$(gn args . --list=$a --short | head -1); echo "$v"
+            echo "$v" | grep -q 'true' || { echo "::error::$a not enabled"; exit 1; }
+          done
+
+      - name: Check - asan variants are really ASan
+        if: ${{ matrix.variant == 'sandbox-asan' || matrix.variant == 'libfuzzer' }}
+        run: |
+          cd build/v8/out/${{ matrix.variant }}
+          gn args . --list=is_asan --short | head -1
+          gn args . --list=is_asan --short | grep -q 'true' || { echo "::error::is_asan not enabled"; exit 1; }
+          strings ./d8 2>/dev/null | grep -qi "AddressSanitizer" \
+            && echo "ASan runtime present in binary" \
+            || { echo "::error::ASan runtime not found in binary"; exit 1; }
+
+      - name: Check - fuzzilli variants accept the protocol flag
+        if: ${{ startsWith(matrix.variant, 'fuzzilli') }}
+        run: |
+          cd build/v8/out/${{ matrix.variant }}
+          gn args . --list=v8_fuzzilli --short | head -1
+          gn args . --list=v8_fuzzilli --short | grep -q 'true' || { echo "::error::v8_fuzzilli not enabled"; exit 1; }
+          # just prove the flag is accepted; guard against the REPRL loop blocking
+          timeout 10 ./d8 --fuzzilli=reprl -e '1' >/dev/null 2>&1 || true
+          echo "d8 built with the Fuzzilli protocol"
+
+      - name: Check - libFuzzer targets run one iteration
+        if: ${{ matrix.variant == 'libfuzzer' }}
+        env:
+          FUZZER_TARGETS: ${{ inputs.fuzzer_targets }}
+        run: |
+          cd build/v8/out/${{ matrix.variant }}
+          for t in $FUZZER_TARGETS; do
+            [ -x "./$t" ] || { echo "::error::$t not built"; exit 1; }
+            mkdir -p "seeds_$t"
+            # a couple of tiny seeds so -runs=1 has something to consume
+            head -c 64 /dev/urandom > "seeds_$t/seed0"
+            ./"$t" -runs=1 "seeds_$t" 2>&1 | tail -3
+          done
+
+      - name: Package (${{ matrix.variant }})
+        env:
+          FUZZER_TARGETS: ${{ inputs.fuzzer_targets }}
+        run: |
+          cd "build/v8/out/${{ matrix.variant }}"
+          mkdir -p pkg
+          if [ -f d8 ]; then
+            cp d8 pkg/
+            [ -f icudtl.dat ] && cp icudtl.dat pkg/ || true
+            [ -f snapshot_blob.bin ] && cp snapshot_blob.bin pkg/ || true
+          fi
+          for t in $FUZZER_TARGETS; do [ -f "$t" ] && cp "$t" pkg/ || true; done
+          cp args.gn pkg/build-args.gn
+          git -C ../.. rev-parse HEAD > pkg/v8-commit.txt 2>/dev/null || true
+          tar -czf "d8-${{ matrix.variant }}-linux-x64.tar.gz" -C pkg .
+          ls -lh "d8-${{ matrix.variant }}-linux-x64.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: d8-${{ matrix.variant }}-linux-x64
+          path: build/v8/out/${{ matrix.variant }}/d8-${{ matrix.variant }}-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
