@@ -126,6 +126,11 @@ jobs:
             git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git && break
             echo "clone attempt $i failed; retrying"; rm -rf depot_tools; sleep 5
           done
+          # depot_tools must be ON PATH so its wrappers (vpython3, gn, ninja)
+          # are resolvable: gclient hooks exec `vpython3` by name and it was
+          # "No such file or directory: 'vpython3'" without this. The env
+          # opt-outs below make them use the system python instead of CIPD's.
+          echo "$PWD/depot_tools" >> "$GITHUB_PATH"
           # VALIDATED FIXES (reproduced and fixed in a local ubuntu:24.04 container):
           #  * depot_tools entry points re-exec through python-bin/python3, which
           #    hard-fails with "python3_bin_reldir.txt not found" unless CIPD
@@ -174,11 +179,8 @@ jobs:
           "$GIT" checkout "$V8_REF"
           echo "V8 commit: $("$GIT" log -1 --format='%H %ci %s')"
 
-      - name: Sync dependencies
-        run: |
-          cd build/v8
-          gclient sync -D --with_branch_heads -R
-          df -h / | tail -1
+      - name: Report disk after sync
+        run: df -h / | tail -1
 
       - name: Configure and build (${{ matrix.variant }})
         env:
