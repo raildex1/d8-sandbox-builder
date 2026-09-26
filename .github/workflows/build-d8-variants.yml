@@ -48,6 +48,11 @@ on:
         required: false
         default: 'v8_simple_json_fuzzer v8_simple_parser_fuzzer'
         type: string
+      build_variants:
+        description: 'Build the d8 variants as well (uncheck for a fuzzilli-tool-only run)'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -112,7 +117,13 @@ jobs:
       - name: Install Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: '6.0'
+          # fuzzilli's sources use trailing commas in argument lists (SE-0439),
+          # which needs Swift >= 6.1. With '6.0' the first attempt died with
+          # "CodeGenerators.swift:1842:13: error: unexpected ',' separator"
+          # (and the same in WasmCodeGenerators.swift / V8CommonProfile.swift).
+          # fuzzilli's own CI does not pin a version at all; 6.2 matches the
+          # toolchain the command was validated with locally.
+          swift-version: '6.2'
       - name: Clone Fuzzilli (pinned)
         run: |
           # Retry: git clones fail transiently on runners ("RPC failed", 503).
@@ -164,6 +175,8 @@ jobs:
 
   build:
     needs: plan
+    # A tool-only run (build_variants=false) skips the long d8 builds.
+    if: ${{ inputs.build_variants }}
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
