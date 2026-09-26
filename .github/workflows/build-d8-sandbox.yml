@@ -89,7 +89,17 @@ jobs:
           # and its only job is `gclient config` + `gclient sync` anyway.
           mkdir -p build && cd build
           ../depot_tools/gclient config --unmanaged https://chromium.googlesource.com/v8/v8.git
-          ../depot_tools/gclient sync -D
+          # Retry: chromium.googlesource.com intermittently returns HTTP 503 /
+          # "fatal: expected 'packfile'" mid-clone. Retry in place, then once more
+          # after clearing a possibly-corrupt partial checkout.
+          attempt=0
+          until ../depot_tools/gclient sync -D; do
+            attempt=$((attempt+1))
+            if [ "$attempt" -ge 3 ]; then echo "gclient sync failed 3x"; exit 1; fi
+            echo "gclient sync attempt $attempt failed (transient 503?); retrying"
+            if [ "$attempt" -ge 2 ]; then rm -rf v8; fi   # clear a possibly-corrupt partial clone
+            sleep 20
+          done
           cd v8
           # depot_tools' `git` is also a python shim; use the real git.
           CLEAN_PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v 'depot_tools' | paste -sd: -)
