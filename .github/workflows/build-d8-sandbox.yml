@@ -1,0 +1,159 @@
+name: Build sandbox-enabled d8 (corruption API + Linux crash filter)
+
+# Ready-to-paste. Put this at .github/workflows/build-d8-sandbox.yml in a PUBLIC
+# repo you own (Actions are free + unmetered on standard runners for public repos),
+# commit it, then run it from the Actions tab ("Run workflow"). See README.md.
+#
+# What it produces: a d8 for linux-x64 built with
+#     v8_enable_sandbox = true               (the sandbox)
+#     v8_enable_memory_corruption_api = true (Sandbox.* under --sandbox-testing)
+#     dcheck_always_on = false               (release: DCHECKs compiled OUT)
+# i.e. the exact configuration in which DCHECK-only guards are absent, the
+# in-cage corruption primitive exists, and the Linux crash filter + the
+# Sandbox.targetPage tripwire are available.
+
+on:
+  workflow_dispatch:
+    inputs:
+      v8_ref:
+        description: 'V8 ref: full SHA, tag, or branch (default = the campaign pin)'
+        required: false
+        default: 'c68946f7099c1a46dd382907e841d77eae7b2659'
+        type: string
+      i18n:
+        description: 'Build with i18n/Intl (true = full corpus fidelity, slower + bigger)'
+        required: false
+        default: false
+        type: boolean
+      dcheck:
+        description: 'Keep DCHECKs ON (debug-comparison build; default false = release)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest          # STANDARD runner only: larger runners are always billed
+    timeout-minutes: 330            # under the 6h per-job ceiling
+
+    steps:
+      # A standard runner is tight for a V8 build; reclaim what we do not need.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/.ghcup /opt/az 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 pkg-config git curl wget
+
+      - name: Install depot_tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch V8 at the requested ref
+        env:
+          V8_REF: ${{ inputs.v8_ref }}
+        run: |
+          mkdir -p build && cd build
+          fetch v8
+          cd v8
+          git fetch --tags origin || true
+          # Tags/branches fetch by name; an arbitrary SHA may not, so fall back to
+          # unshallowing and checking the object out of the local history.
+          if git fetch origin "$V8_REF" 2>/dev/null; then
+            git checkout FETCH_HEAD
+          else
+            echo "direct fetch of '$V8_REF' failed; unshallowing to reach the commit"
+            git fetch --unshallow origin 2>/dev/null || git fetch origin 2>/dev/null || true
+            git checkout "$V8_REF"
+          fi
+          echo "V8 commit: $(git log -1 --format='%H %ci %s')"
+
+      - name: Sync dependencies
+        run: |
+          cd build/v8
+          gclient sync -D --with_branch_heads -R
+          df -h / | tail -1
+
+      - name: Configure and build d8
+        env:
+          I18N: ${{ inputs.i18n }}
+          DCHECK: ${{ inputs.dcheck }}
+        run: |
+          cd build/v8
+          # NOTE: args are passed via --args on the command line; a source-root
+          # args.gn proved unreliable for some V8 revisions.
+          GN_ARGS='is_debug=false is_component_build=false v8_static_library=true v8_use_external_startup_data=false use_custom_libcxx=true target_cpu="x64" treat_warnings_as_errors=false is_clang=true use_lld=true clang_use_chrome_plugins=false v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_object_print=true v8_enable_disassembler=true v8_enable_test_features=true v8_enable_debugging_features=false v8_enable_verify_heap=false v8_enable_debug_code=false v8_enable_v8_checks=false cppgc_enable_verify_heap=false v8_enable_slow_dchecks=false dcheck_always_on=false'
+          if [ "$I18N" = "true" ]; then
+            GN_ARGS="$GN_ARGS v8_enable_i18n_support=true"
+          else
+            GN_ARGS="$GN_ARGS v8_enable_i18n_support=false"
+          fi
+          if [ "$DCHECK" = "true" ]; then
+            GN_ARGS="$GN_ARGS dcheck_always_on=true"
+          fi
+          gn gen out.gn/x64.release --args="$GN_ARGS"
+          echo "=== resolved args.gn ==="; cat out.gn/x64.release/args.gn
+          ninja -C out.gn/x64.release d8 -j2
+          ls -lh out.gn/x64.release/d8
+
+      # Hard gate: abort packaging unless the required configuration is present.
+      - name: Enforce required configuration
+        env:
+          DCHECK: ${{ inputs.dcheck }}
+        run: |
+          cd build/v8
+          fail=0
+          for a in v8_enable_sandbox v8_enable_memory_corruption_api; do
+            v=$(gn args out.gn/x64.release --list=$a --short | head -1); echo "$v"
+            echo "$v" | grep -q 'true' || fail=1
+          done
+          if [ "$DCHECK" != "true" ]; then
+            for a in v8_enable_debugging_features dcheck_always_on; do
+              v=$(gn args out.gn/x64.release --list=$a --short | head -1); echo "$v"
+              echo "$v" | grep -q 'false' || fail=1
+            done
+          fi
+          [ $fail -eq 0 ] || { echo "::error::required build configuration not satisfied"; exit 1; }
+
+      # Executed acceptance test: prove Sandbox.* and the tripwire really exist.
+      # Both flags are passed; d8 only warns about an unknown flag, so this works
+      # whether the revision exposes the API via --sandbox-testing alone (older)
+      # or via the separate --expose-memory-corruption-api flag (newer).
+      - name: Acceptance test (executed)
+        run: |
+          cd build/v8/out.gn/x64.release
+          ./d8 --sandbox-testing --expose-memory-corruption-api -e '
+            if (typeof Sandbox !== "object") throw new Error("Sandbox API missing");
+            if (typeof Sandbox.targetPage !== "number") throw new Error("targetPage missing");
+            print("Sandbox API OK: methods=" + Object.keys(Sandbox).length +
+                  " base=0x" + Sandbox.base.toString(16) +
+                  " targetPage=0x" + Sandbox.targetPage.toString(16));
+          '
+
+      - name: Package
+        run: |
+          cd build/v8/out.gn/x64.release
+          mkdir -p pkg
+          cp d8 pkg/
+          [ -f icudtl.dat ] && cp icudtl.dat pkg/ || true
+          [ -f snapshot_blob.bin ] && cp snapshot_blob.bin pkg/ || true
+          cp args.gn pkg/build-args.gn
+          tar -czf d8-sandbox-linux-x64.tar.gz -C pkg .
+          ls -lh d8-sandbox-linux-x64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: d8-sandbox-linux-x64
+          path: build/v8/out.gn/x64.release/d8-sandbox-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14        # keeps the shared 500 MB Free-tier allowance small
