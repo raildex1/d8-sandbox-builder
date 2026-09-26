@@ -26,9 +26,6 @@ name: Build V8/d8 variants (sandbox, sanitizers, Fuzzilli, libFuzzer, coverage)
 #    ("sanitizer coverage for v8 is currently not supported on macOS"), hence Linux.
 #  * --run-as-security-poc rejects --expose-memory-corruption-api; use --sandbox-testing
 #    (or --sandbox-fuzzing) for corruption-API work.
-#  * The `fuzzilli-tool` job builds the *driver* (FuzzilliCli) so it never has to be
-#    built on the macOS host: the tool must run in the same Linux container as the
-#    fuzzilli d8, because Fuzzilli's shared-memory coverage cannot cross `docker exec`.
 
 on:
   workflow_dispatch:
@@ -48,11 +45,6 @@ on:
         required: false
         default: 'v8_simple_json_fuzzer v8_simple_parser_fuzzer'
         type: string
-      build_variants:
-        description: 'Build the d8 variants as well (uncheck for a fuzzilli-tool-only run)'
-        required: false
-        default: true
-        type: boolean
 
 permissions:
   contents: read
@@ -76,6 +68,9 @@ jobs:
           variants = [
               {"variant": "sandbox",
                "gn": "is_debug=false symbol_level=0 v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false",
+               "target": "d8"},
+              {"variant": "sandbox-off",
+               "gn": "is_debug=false symbol_level=0 v8_enable_sandbox=false v8_enable_memory_corruption_api=false v8_enable_i18n_support=false v8_use_external_startup_data=false",
                "target": "d8"},
               {"variant": "sandbox-dcheck",
                "gn": "is_debug=false dcheck_always_on=true symbol_level=1 v8_enable_verify_heap=true v8_enable_slow_dchecks=true v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false",
@@ -107,76 +102,8 @@ jobs:
           print("matrix=" + json.dumps({"include": variants}))
           PY
 
-  # The Fuzzilli *driver*. Small artifact, no V8 build, no local Swift toolchain:
-  # this is what lets the fuzzer run inside Linux next to the d8 (shared-memory
-  # coverage does not survive `docker exec`, so a macOS-built driver is useless).
-  fuzzilli-tool:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - name: Install Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          # fuzzilli's sources use trailing commas in argument lists (SE-0439),
-          # which needs Swift >= 6.1. With '6.0' the first attempt died with
-          # "CodeGenerators.swift:1842:13: error: unexpected ',' separator"
-          # (and the same in WasmCodeGenerators.swift / V8CommonProfile.swift).
-          # fuzzilli's own CI does not pin a version at all; 6.2 matches the
-          # toolchain the command was validated with locally.
-          swift-version: '6.2'
-      - name: Clone Fuzzilli (pinned)
-        run: |
-          # Retry: git clones fail transiently on runners ("RPC failed", 503).
-          for i in 1 2 3; do
-            git clone --filter=blob:none https://github.com/googleprojectzero/fuzzilli.git && break
-            echo "clone attempt $i failed; retrying"; rm -rf fuzzilli; sleep 5
-          done
-          cd fuzzilli
-          git checkout 959e88940989bae43efea26e6ed5f7f9b6db1ab6
-          git log -1 --format='fuzzilli %H %ci %s'
-      - name: Build FuzzilliCli
-        run: |
-          cd fuzzilli
-          # Prefer a self-contained binary so it runs in a bare debian container.
-          if swift build -c release --product FuzzilliCli --static-swift-stdlib; then
-            echo "static Swift stdlib build OK"
-          else
-            echo "static stdlib build failed; falling back to dynamic + bundled runtime"
-            swift build -c release --product FuzzilliCli
-            echo "DYNAMIC_RUNTIME=1" >> "$GITHUB_ENV"
-          fi
-          ls -lh .build/release/FuzzilliCli
-      - name: Package
-        env:
-          DYNAMIC_RUNTIME: ${{ env.DYNAMIC_RUNTIME }}
-        run: |
-          set -x
-          mkdir -p pkg
-          cp fuzzilli/.build/release/FuzzilliCli pkg/
-          # Bundling the Swift runtime is only needed on the dynamic fallback.
-          if ldd pkg/FuzzilliCli >/dev/null 2>&1; then
-            ldd pkg/FuzzilliCli | awk '{print $3}' | grep -E '^/' | while read -r l; do
-              case "$l" in
-                */libc.so*|*/libm.so*|*/libpthread*|*/libdl*|*/librt*|*/libgcc_s*|*/libstdc++*) ;;
-                *) cp "$l" pkg/ ;;
-              esac
-            done
-          fi
-          git -C fuzzilli rev-parse HEAD > pkg/fuzzilli-commit.txt
-          tar -czf fuzzilli-tool-linux-x64.tar.gz -C pkg .
-          ls -lh fuzzilli-tool-linux-x64.tar.gz
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzzilli-tool-linux-x64
-          path: fuzzilli-tool-linux-x64.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-
   build:
     needs: plan
-    # A tool-only run (build_variants=false) skips the long d8 builds.
-    if: ${{ inputs.build_variants }}
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
@@ -304,22 +231,15 @@ jobs:
         env:
           FUZZER_TARGETS: ${{ inputs.fuzzer_targets }}
         run: |
-          set -x
           cd "build/v8/out/${{ matrix.variant }}"
           mkdir -p pkg
           if [ -f d8 ]; then
             cp d8 pkg/
-          fi
-          # Startup data and the sanitizer runtime shim are needed by d8 *and* by
-          # the v8_simple_*_fuzzer targets. These used to sit inside the `d8` test
-          # above, so the libfuzzer variant shipped a fuzzer that could not start:
-          #   "error while loading shared libraries: libsanitizer_shared_hooks.so"
-          #   "Failed to open startup resource './snapshot_blob.bin'"
-          # Copy them whenever the build produced them, regardless of variant.
-          [ -f icudtl.dat ] && cp icudtl.dat pkg/ || true
-          [ -f snapshot_blob.bin ] && cp snapshot_blob.bin pkg/ || true
-          # is_asan builds (d8 and fuzzer targets) need their runtime shim too.
+            [ -f icudtl.dat ] && cp icudtl.dat pkg/ || true
+            [ -f snapshot_blob.bin ] && cp snapshot_blob.bin pkg/ || true
+          # is_asan builds need their runtime shim next to the binary.
           cp ./*.so pkg/ 2>/dev/null || true
+          fi
           for t in $FUZZER_TARGETS; do [ -f "$t" ] && cp "$t" pkg/ || true; done
           cp args.gn pkg/build-args.gn
           git -C ../.. rev-parse HEAD > pkg/v8-commit.txt 2>/dev/null || true
