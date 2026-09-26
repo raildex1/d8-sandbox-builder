@@ -185,7 +185,7 @@ jobs:
       - name: Configure and build (${{ matrix.variant }})
         env:
           EXTRA: ${{ matrix.gn }}
-          TARGET: ${{ matrix.target }}
+          BUILD_TARGET: ${{ matrix.target }}
           FUZZER_TARGETS: ${{ inputs.fuzzer_targets }}
         run: |
           cd build/v8
@@ -193,11 +193,11 @@ jobs:
           GN_ARGS="$BASE $EXTRA"
           gn gen "out/${{ matrix.variant }}" --args="$GN_ARGS"
           echo "=== resolved args.gn ==="; cat "out/${{ matrix.variant }}/args.gn"
-          if [ "$TARGET" = "__FUZZERS__" ]; then
+          if [ "$BUILD_TARGET" = "__FUZZERS__" ]; then
             # shellcheck disable=SC2086
             ninja -C "out/${{ matrix.variant }}" $FUZZER_TARGETS -j2
           else
-            ninja -C "out/${{ matrix.variant }}" "$TARGET" -j2
+            ninja -C "out/${{ matrix.variant }}" "$BUILD_TARGET" -j2
           fi
           df -h / | tail -1
 
