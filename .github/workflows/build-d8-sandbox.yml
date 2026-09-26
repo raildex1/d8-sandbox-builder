@@ -57,6 +57,9 @@ jobs:
         run: |
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
           echo "$PWD/depot_tools" >> "$GITHUB_PATH"
+          # Write the bootstrap sentinel the bundled python shims look for; without
+          # it a non-interactive run dies with "python3_bin_reldir.txt not found".
+          ./depot_tools/ensure_bootstrap || true
 
       - name: Fetch V8 at the requested ref
         env:
@@ -65,17 +68,19 @@ jobs:
           mkdir -p build && cd build
           fetch v8
           cd v8
-          git fetch --tags origin || true
-          # Tags/branches fetch by name; an arbitrary SHA may not, so fall back to
-          # unshallowing and checking the object out of the local history.
-          if git fetch origin "$V8_REF" 2>/dev/null; then
-            git checkout FETCH_HEAD
-          else
-            echo "direct fetch of '$V8_REF' failed; unshallowing to reach the commit"
-            git fetch --unshallow origin 2>/dev/null || git fetch origin 2>/dev/null || true
-            git checkout "$V8_REF"
+          # Use the system git: depot_tools' python-shimmed `git` fails in CI.
+          GIT=/usr/bin/git; [ -x "$GIT" ] || GIT=$(command -v git)
+          echo "using: $("$GIT" --version)"
+          if ! "$GIT" cat-file -e "${V8_REF}^{commit}" 2>/dev/null; then
+            echo "commit not present locally; fetching"
+            "$GIT" fetch --tags origin || true
+            if [ "$("$GIT" rev-parse --is-shallow-repository)" = "true" ]; then
+              "$GIT" fetch --unshallow origin || true
+            fi
+            "$GIT" fetch origin main || true
           fi
-          echo "V8 commit: $(git log -1 --format='%H %ci %s')"
+          "$GIT" checkout "$V8_REF"
+          echo "V8 commit: $("$GIT" log -1 --format='%H %ci %s')"
 
       - name: Sync dependencies
         run: |
