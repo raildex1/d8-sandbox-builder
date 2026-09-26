@@ -189,6 +189,9 @@ jobs:
           FUZZER_TARGETS: ${{ inputs.fuzzer_targets }}
         run: |
           cd build/v8
+          # bindgen (used by the Rust FFI generator) aborts if TARGET is set in
+          # the environment; unset defensively as well as not defining it.
+          unset TARGET || true
           BASE='is_component_build=false use_custom_libcxx=true target_cpu="x64" treat_warnings_as_errors=false is_clang=true use_lld=true clang_use_chrome_plugins=false v8_enable_object_print=true v8_enable_disassembler=true v8_enable_test_features=true'
           GN_ARGS="$BASE $EXTRA"
           gn gen "out/${{ matrix.variant }}" --args="$GN_ARGS"
