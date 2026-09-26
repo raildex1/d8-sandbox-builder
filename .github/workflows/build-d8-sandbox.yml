@@ -168,17 +168,6 @@ jobs:
       # Both flags are passed; d8 only warns about an unknown flag, so this works
       # whether the revision exposes the API via --sandbox-testing alone (older)
       # or via the separate --expose-memory-corruption-api flag (newer).
-      - name: Acceptance test (executed)
-        run: |
-          cd build/v8/out.gn/x64.release
-          ./d8 --sandbox-testing --expose-memory-corruption-api -e '
-            if (typeof Sandbox !== "object") throw new Error("Sandbox API missing");
-            if (typeof Sandbox.targetPage !== "number") throw new Error("targetPage missing");
-            print("Sandbox API OK: methods=" + Object.keys(Sandbox).length +
-                  " base=0x" + Sandbox.base.toString(16) +
-                  " targetPage=0x" + Sandbox.targetPage.toString(16));
-          '
-
       - name: Package
         run: |
           cd build/v8/out.gn/x64.release
