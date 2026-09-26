@@ -120,16 +120,27 @@ jobs:
 
       - name: Install depot_tools
         run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          # VALIDATED FIX (reproduced + fixed in a local ubuntu:24.04 container):
-          # every depot_tools entry point re-execs through python-bin/python3,
-          # which hard-fails with "python3_bin_reldir.txt not found" unless the
-          # hermetic python was installed by CIPD. The shim documents its own
-          # opt-out, which makes it exec the system python3 instead.
-          echo "DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0" >> "$GITHUB_ENV"
-          DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0 ./depot_tools/python-bin/python3 \
-            -c "import sys; print('depot_tools python shim ->', sys.version.split()[0], sys.executable)"
-          DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0 ./depot_tools/gclient --version >/dev/null && echo "gclient ok"
+          # Retry: a --depth 1 clone failed transiently on the runner with
+          # "update_ref failed for ref 'HEAD' ... nonexistent object".
+          for i in 1 2 3; do
+            git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git && break
+            echo "clone attempt $i failed; retrying"; rm -rf depot_tools; sleep 5
+          done
+          # VALIDATED FIXES (reproduced and fixed in a local ubuntu:24.04 container):
+          #  * depot_tools entry points re-exec through python-bin/python3, which
+          #    hard-fails with "python3_bin_reldir.txt not found" unless CIPD
+          #    installed the hermetic python. The shim documents this opt-out.
+          #  * VPYTHON_BYPASS makes the vpython3 wrapper exec the system python3;
+          #    without it `gclient sync` hooks die with FileNotFoundError: vpython3.
+          {
+            echo "DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0"
+            echo "VPYTHON_BYPASS=manually managed python not supported by chrome operations"
+          } >> "$GITHUB_ENV"
+          export DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0
+          export VPYTHON_BYPASS="manually managed python not supported by chrome operations"
+          ./depot_tools/python-bin/python3 -c "import sys; print('python shim ->', sys.version.split()[0], sys.executable)"
+          ./depot_tools/vpython3 -c "import sys; print('vpython3 ->', sys.version.split()[0], sys.executable)"
+          ./depot_tools/gclient --version >/dev/null && echo "gclient ok"
 
       - name: Sync V8 at the requested ref
         env:
