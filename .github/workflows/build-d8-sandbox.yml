@@ -51,35 +51,42 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 pkg-config git curl wget
+          # python3-setuptools restores `distutils` on Ubuntu 24.04's Python 3.12
+          # (removed upstream), which depot_tools' fetch.py still imports.
+          sudo apt-get install -y python3 python3-setuptools pkg-config git curl wget
+          python3 -c "from distutils import spawn; print('distutils ok')"
 
       - name: Install depot_tools
         run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo "$PWD/depot_tools" >> "$GITHUB_PATH"
-          # No ensure_bootstrap: CIPD cannot install its client here, so
-          # bootstrap_python3 fails and depot_tools' shims end up broken,
-          # which breaks `fetch v8` itself. Plain `fetch v8` works.
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          # VALIDATED FIX (reproduced + fixed in a local ubuntu:24.04 container):
+          # every depot_tools entry point re-execs through python-bin/python3,
+          # which hard-fails with "python3_bin_reldir.txt not found" unless the
+          # hermetic python was installed by CIPD. The shim documents its own
+          # opt-out, which makes it exec the system python3 instead.
+          echo "DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0" >> "$GITHUB_ENV"
+          DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0 ./depot_tools/python-bin/python3 \
+            -c "import sys; print('depot_tools python shim ->', sys.version.split()[0], sys.executable)"
+          DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0 ./depot_tools/gclient --version >/dev/null && echo "gclient ok"
 
-      - name: Fetch V8 at the requested ref
+      - name: Sync V8 at the requested ref
         env:
           V8_REF: ${{ inputs.v8_ref }}
         run: |
+          set -x
+          # Use gclient directly instead of `fetch`: fetch.py imports distutils,
+          # and its only job is `gclient config` + `gclient sync` anyway.
           mkdir -p build && cd build
-          fetch v8
+          ../depot_tools/gclient config --unmanaged https://chromium.googlesource.com/v8/v8.git
+          ../depot_tools/gclient sync -D
           cd v8
-          # depot_tools' `git` is a python shim; strip depot_tools from PATH to
-          # get the real git.
+          # depot_tools' `git` is also a python shim; use the real git.
           CLEAN_PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v 'depot_tools' | paste -sd: -)
           GIT=$(PATH="$CLEAN_PATH" command -v git)
           echo "using: $GIT ($("$GIT" --version))"
           if ! "$GIT" cat-file -e "${V8_REF}^{commit}" 2>/dev/null; then
-            echo "commit not present locally; fetching"
-            "$GIT" fetch --tags origin || true
-            if [ "$("$GIT" rev-parse --is-shallow-repository)" = "true" ]; then
-              "$GIT" fetch --unshallow origin || true
-            fi
-            "$GIT" fetch origin main || true
+            echo "pinned commit absent; fetching"
+            "$GIT" fetch origin "$V8_REF" || "$GIT" fetch origin main || true
           fi
           "$GIT" checkout "$V8_REF"
           echo "V8 commit: $("$GIT" log -1 --format='%H %ci %s')"
