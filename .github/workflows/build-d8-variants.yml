@@ -50,33 +50,57 @@ permissions:
   contents: read
 
 jobs:
+  # Resolve the variant list BEFORE the build jobs so the `only` filter works.
+  # A job-level `if` cannot reference `matrix` — GitHub allows only
+  # github/needs/vars/inputs in jobs.<id>.if — so filtering has to happen while
+  # the matrix is built, not afterwards.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          variants = [
+              {"variant": "sandbox",
+               "gn": "is_debug=false symbol_level=0 v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false",
+               "target": "d8"},
+              {"variant": "sandbox-dcheck",
+               "gn": "is_debug=false dcheck_always_on=true symbol_level=1 v8_enable_verify_heap=true v8_enable_slow_dchecks=true v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false",
+               "target": "d8"},
+              {"variant": "sandbox-asan",
+               "gn": "is_debug=false symbol_level=0 is_asan=true v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false",
+               "target": "d8"},
+              {"variant": "fuzzilli",
+               "gn": "is_debug=false dcheck_always_on=true symbol_level=1 v8_static_library=true v8_enable_verify_heap=true v8_enable_partition_alloc=false v8_fuzzilli=true sanitizer_coverage_flags=\"trace-pc-guard\"",
+               "target": "d8"},
+              {"variant": "fuzzilli-sandbox",
+               "gn": "is_debug=false dcheck_always_on=true symbol_level=1 v8_static_library=true v8_enable_verify_heap=true v8_enable_partition_alloc=false v8_fuzzilli=true sanitizer_coverage_flags=\"trace-pc-guard\" v8_enable_sandbox=true v8_enable_memory_corruption_api=true",
+               "target": "d8"},
+              {"variant": "libfuzzer",
+               "gn": "is_debug=false symbol_level=0 is_asan=true use_libfuzzer=true v8_wasm_random_fuzzers=true sanitizer_coverage_flags=\"trace-pc-guard\" v8_enable_i18n_support=false",
+               "target": "__FUZZERS__"},
+          ]
+          only = [s.strip() for s in os.environ.get("ONLY", "").split(",") if s.strip()]
+          if only:
+              variants = [v for v in variants if v["variant"] in only]
+          if not variants:
+              raise SystemExit("no variants match ONLY=" + os.environ.get("ONLY", ""))
+          print("matrix=" + json.dumps({"include": variants}))
+          PY
+
   build:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 340
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - variant: sandbox
-            gn: 'is_debug=false symbol_level=0 v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false'
-            target: 'd8'
-          - variant: sandbox-dcheck
-            gn: 'is_debug=false dcheck_always_on=true symbol_level=1 v8_enable_verify_heap=true v8_enable_slow_dchecks=true v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false'
-            target: 'd8'
-          - variant: sandbox-asan
-            gn: 'is_debug=false symbol_level=0 is_asan=true v8_enable_sandbox=true v8_enable_memory_corruption_api=true v8_enable_i18n_support=false v8_use_external_startup_data=false'
-            target: 'd8'
-          - variant: fuzzilli
-            gn: 'is_debug=false dcheck_always_on=true symbol_level=1 v8_static_library=true v8_enable_verify_heap=true v8_enable_partition_alloc=false v8_fuzzilli=true sanitizer_coverage_flags="trace-pc-guard"'
-            target: 'd8'
-          - variant: fuzzilli-sandbox
-            gn: 'is_debug=false dcheck_always_on=true symbol_level=1 v8_static_library=true v8_enable_verify_heap=true v8_enable_partition_alloc=false v8_fuzzilli=true sanitizer_coverage_flags="trace-pc-guard" v8_enable_sandbox=true v8_enable_memory_corruption_api=true'
-            target: 'd8'
-          - variant: libfuzzer
-            gn: 'is_debug=false symbol_level=0 is_asan=true use_libfuzzer=true v8_wasm_random_fuzzers=true sanitizer_coverage_flags="trace-pc-guard" v8_enable_i18n_support=false'
-            target: '__FUZZERS__'
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     name: ${{ matrix.variant }}
-    if: ${{ inputs.only == '' || contains(inputs.only, matrix.variant) }}
 
     steps:
       - name: Free disk space
