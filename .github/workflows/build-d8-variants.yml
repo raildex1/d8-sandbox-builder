@@ -228,6 +228,8 @@ jobs:
             cp d8 pkg/
             [ -f icudtl.dat ] && cp icudtl.dat pkg/ || true
             [ -f snapshot_blob.bin ] && cp snapshot_blob.bin pkg/ || true
+          # is_asan builds need their runtime shim next to the binary.
+          cp ./*.so pkg/ 2>/dev/null || true
           fi
           for t in $FUZZER_TARGETS; do [ -f "$t" ] && cp "$t" pkg/ || true; done
           cp args.gn pkg/build-args.gn
