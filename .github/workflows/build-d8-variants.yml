@@ -43,7 +43,7 @@ on:
       fuzzer_targets:
         description: 'libFuzzer targets to build for the libfuzzer variant'
         required: false
-        default: 'v8_simple_json_fuzzer v8_simple_wasm_fuzzer'
+        default: 'v8_simple_json_fuzzer v8_simple_parser_fuzzer'
         type: string
 
 permissions:
